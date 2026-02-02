@@ -1,4 +1,6 @@
 import argparse
+import time
+import uuid
 import requests
 from urllib.parse import quote_plus
 from json import dumps, decoder
@@ -10,28 +12,63 @@ from phonenumbers.phonenumberutil import (
 )
 import pycountry
 
+USER_AGENT = "Instagram 317.0.0.34.109 Android (31/12; 420dpi; 1080x2276; samsung; SM-G991B; o1s; exynos2100)"
+IG_APP_ID = "936619743392459"
+COMMON_HEADERS = {
+    "User-Agent": USER_AGENT,
+    "X-IG-App-ID": IG_APP_ID,
+    "X-IG-Connection-Type": "WiFi",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Accept-Encoding": "gzip, deflate",
+}
+MAX_RETRIES = 3
+RETRY_BASE_DELAY = 2
 
-def getUserId(username, sessionsId):
-    headers = {"User-Agent": "iphone_ua", "x-ig-app-id": "936619743392459"}
-    api = requests.get(
+
+def _create_session(sessionId):
+    session = requests.Session()
+    session.headers.update(COMMON_HEADERS)
+    session.cookies.set("sessionid", sessionId, domain=".instagram.com")
+    session.headers["X-IG-Device-ID"] = str(uuid.uuid4())
+    return session
+
+
+def _request_with_retry(method, session, url, **kwargs):
+    for attempt in range(MAX_RETRIES):
+        response = method(url, **kwargs)
+        if response.status_code == 429:
+            delay = RETRY_BASE_DELAY ** (attempt + 1)
+            print(f"Rate limited, retrying in {delay}s... (attempt {attempt + 1}/{MAX_RETRIES})")
+            time.sleep(delay)
+            continue
+        return response
+    return response
+
+
+def getUserId(username, session):
+    response = _request_with_retry(
+        session.get, session,
         f'https://i.instagram.com/api/v1/users/web_profile_info/?username={username}',
-        headers=headers,
-        cookies={'sessionid': sessionsId}
     )
-    try:
-        if api.status_code == 404:
-            return {"id": None, "error": "User not found"}
-
-        id = api.json()["data"]['user']['id']
-        return {"id": id, "error": None}
-
-    except decoder.JSONDecodeError:
+    if response.status_code == 404:
+        return {"id": None, "error": "User not found"}
+    if response.status_code == 401:
+        return {"id": None, "error": "Invalid or expired session ID"}
+    if response.status_code == 429:
         return {"id": None, "error": "Rate limit"}
 
+    try:
+        user_id = response.json()["data"]['user']['id']
+        return {"id": user_id, "error": None}
+    except (decoder.JSONDecodeError, KeyError, TypeError):
+        return {"id": None, "error": f"Rate limit (status {response.status_code})"}
 
-def getInfo(search, sessionId, searchType="username" or "id"):
+
+def getInfo(search, sessionId, searchType="username"):
+    session = _create_session(sessionId)
+
     if searchType == "username":
-        data = getUserId(search, sessionId)
+        data = getUserId(search, session)
         if data["error"]:
             return data
         userId = data["id"]
@@ -41,12 +78,15 @@ def getInfo(search, sessionId, searchType="username" or "id"):
         except ValueError:
             return {"user": None, "error": "Invalid ID"}
 
+    time.sleep(1.5)
+
     try:
-        response = requests.get(
+        response = _request_with_retry(
+            session.get, session,
             f'https://i.instagram.com/api/v1/users/{userId}/info/',
-            headers={'User-Agent': 'Instagram 64.0.0.14.96'},
-            cookies={'sessionid': sessionId}
         )
+        if response.status_code == 401:
+            return {"user": None, "error": "Invalid or expired session ID"}
         if response.status_code == 429:
             return {"user": None, "error": "Rate limit"}
 
@@ -57,13 +97,14 @@ def getInfo(search, sessionId, searchType="username" or "id"):
             return {"user": None, "error": "Not found"}
 
         info_user["userID"] = userId
+        info_user["_session"] = session
         return {"user": info_user, "error": None}
 
     except requests.exceptions.RequestException:
         return {"user": None, "error": "Not found"}
 
 
-def advanced_lookup(username):
+def advanced_lookup(username, session):
     """
         Post to get obfuscated login infos
     """
@@ -71,16 +112,15 @@ def advanced_lookup(username):
         {"q": username, "skip_recovery": "1"},
         separators=(",", ":")
     ))
-    api = requests.post(
+
+    time.sleep(1.5)
+
+    response = _request_with_retry(
+        session.post, session,
         'https://i.instagram.com/api/v1/users/lookup/',
         headers={
-            "Accept-Language": "en-US",
-            "User-Agent": "Instagram 101.0.0.15.120",
             "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
-            "X-IG-App-ID": "124024574287414",
-            "Accept-Encoding": "gzip, deflate",
             "Host": "i.instagram.com",
-            # "X-FB-HTTP-Engine": "Liger",
             "Connection": "keep-alive",
             "Content-Length": str(len(data))
         },
@@ -88,9 +128,9 @@ def advanced_lookup(username):
     )
 
     try:
-        return ({"user": api.json(), "error": None})
+        return {"user": response.json(), "error": None}
     except decoder.JSONDecodeError:
-        return ({"user": None, "error": "rate limit"})
+        return {"user": None, "error": "rate limit"}
 
 
 def main():
@@ -108,6 +148,7 @@ def main():
     if not infos.get("user"):
         exit(infos["error"])
 
+    session = infos["user"].pop("_session", None)
     infos = infos["user"]
 
     print("Informations about     : " + infos["username"])
@@ -119,14 +160,14 @@ def main():
     print(
         "Follower               : " + str(infos["follower_count"]) + " | Following : " + str(infos["following_count"]))
     print("Number of posts        : " + str(infos["media_count"]))
-    # print("Number of tag in posts : "+str(infos["following_tag_count"]))
     if infos["external_url"]:
         print("External url           : " + infos["external_url"])
-    print("IGTV posts             : " + str(infos["total_igtv_videos"]))
-    print("Biography              : " + (f"""\n{" " * 25}""").join(infos["biography"].split("\n")))
-    print("Linked WhatsApp        : " + str(infos["is_whatsapp_linked"]))
-    print("Memorial Account       : " + str(infos["is_memorialized"]))
-    print("New Instagram user     : " + str(infos["is_new_to_instagram"]))
+    if "total_igtv_videos" in infos:
+        print("IGTV posts             : " + str(infos["total_igtv_videos"]))
+    print("Biography              : " + (f"""\n{" " * 25}""").join(infos.get("biography", "").split("\n")))
+    print("Linked WhatsApp        : " + str(infos.get("is_whatsapp_linked", "N/A")))
+    print("Memorial Account       : " + str(infos.get("is_memorialized", "N/A")))
+    print("New Instagram user     : " + str(infos.get("is_new_to_instagram", "N/A")))
 
     if "public_email" in infos.keys():
         if infos["public_email"]:
@@ -140,11 +181,11 @@ def main():
                 countrycode = region_code_for_country_code(pn.country_code)
                 country = pycountry.countries.get(alpha_2=countrycode)
                 phonenr = phonenr + " ({}) ".format(country.name)
-            except:  # except what ??
-                pass  # pass what ??
+            except (phonenumbers.NumberParseException, AttributeError):
+                pass
             print("Public Phone number    : " + phonenr)
 
-    other_infos = advanced_lookup(infos["username"])
+    other_infos = advanced_lookup(infos["username"], session)
 
     if other_infos["error"] == "rate limit":
         print("Rate limit please wait a few minutes before you try again")
