@@ -1,4 +1,5 @@
 import argparse
+import random
 import time
 import uuid
 import requests
@@ -21,7 +22,7 @@ COMMON_HEADERS = {
     "Accept-Language": "en-US,en;q=0.9",
     "Accept-Encoding": "gzip, deflate",
 }
-MAX_RETRIES = 3
+MAX_RETRIES = 5
 RETRY_BASE_DELAY = 2
 
 
@@ -37,8 +38,13 @@ def _request_with_retry(method, session, url, **kwargs):
     for attempt in range(MAX_RETRIES):
         response = method(url, **kwargs)
         if response.status_code == 429:
-            delay = RETRY_BASE_DELAY ** (attempt + 1)
-            print(f"Rate limited, retrying in {delay}s... (attempt {attempt + 1}/{MAX_RETRIES})")
+            retry_after = response.headers.get("Retry-After")
+            if retry_after:
+                delay = float(retry_after)
+            else:
+                delay = RETRY_BASE_DELAY * (2 ** attempt)
+            delay = delay + random.uniform(0, delay * 0.25)
+            print(f"Rate limited, retrying in {delay:.1f}s... (attempt {attempt + 1}/{MAX_RETRIES})")
             time.sleep(delay)
             continue
         return response
