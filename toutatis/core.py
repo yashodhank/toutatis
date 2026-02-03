@@ -30,7 +30,7 @@ def _create_session(sessionId):
     session = requests.Session()
     session.headers.update(COMMON_HEADERS)
     session.cookies.set("sessionid", sessionId, domain=".instagram.com")
-    session.headers["X-IG-Device-ID"] = str(uuid.uuid4())
+    session.headers["X-IG-Device-ID"] = str(uuid.uuid5(uuid.NAMESPACE_URL, sessionId))
     return session
 
 
@@ -57,27 +57,52 @@ def getUserId(username, session):
         f'https://i.instagram.com/api/v1/users/web_profile_info/?username={username}',
     )
     if response.status_code == 404:
-        return {"id": None, "error": "User not found"}
+        return {"id": None, "user": None, "error": "User not found"}
     if response.status_code == 401:
-        return {"id": None, "error": "Invalid or expired session ID"}
+        return {"id": None, "user": None, "error": "Invalid or expired session ID"}
     if response.status_code == 429:
-        return {"id": None, "error": "Rate limit"}
+        return {"id": None, "user": None, "error": "Rate limit"}
 
     try:
-        user_id = response.json()["data"]['user']['id']
-        return {"id": user_id, "error": None}
+        user_data = response.json()["data"]['user']
+        user_id = user_data['id']
+        return {"id": user_id, "user": user_data, "error": None}
     except (decoder.JSONDecodeError, KeyError, TypeError):
-        return {"id": None, "error": f"Rate limit (status {response.status_code})"}
+        return {"id": None, "user": None, "error": f"Rate limit (status {response.status_code})"}
+
+
+def _validate_session(session):
+    """Validate session with a lightweight request before making API calls."""
+    try:
+        response = session.get(
+            'https://i.instagram.com/api/v1/accounts/current_user/?edit=true',
+            timeout=10,
+        )
+        if response.status_code in (401, 403):
+            return False
+        return True
+    except requests.exceptions.RequestException:
+        return False
 
 
 def getInfo(search, sessionId, searchType="username"):
     session = _create_session(sessionId)
+
+    if not _validate_session(session):
+        return {
+            "user": None,
+            "error": "Session appears blocked. Try generating the session ID from this machine or use a proxy.",
+        }
 
     if searchType == "username":
         data = getUserId(search, session)
         if data["error"]:
             return data
         userId = data["id"]
+        info_user = data["user"]
+        info_user["userID"] = userId
+        info_user["_session"] = session
+        return {"user": info_user, "error": None}
     else:
         try:
             userId = str(int(search))
@@ -119,7 +144,7 @@ def advanced_lookup(username, session):
         separators=(",", ":")
     ))
 
-    time.sleep(1.5)
+    time.sleep(3 + random.uniform(0, 2))
 
     response = _request_with_retry(
         session.post, session,
