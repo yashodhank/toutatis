@@ -34,7 +34,7 @@ def _create_session(sessionId):
     return session
 
 
-def _request_with_retry(method, session, url, **kwargs):
+def _request_with_retry(method, url, **kwargs):
     for attempt in range(MAX_RETRIES):
         response = method(url, **kwargs)
         if response.status_code == 429:
@@ -53,7 +53,7 @@ def _request_with_retry(method, session, url, **kwargs):
 
 def getUserId(username, session):
     response = _request_with_retry(
-        session.get, session,
+        session.get,
         f'https://i.instagram.com/api/v1/users/web_profile_info/?username={username}',
     )
     if response.status_code == 404:
@@ -67,8 +67,10 @@ def getUserId(username, session):
         user_data = response.json()["data"]['user']
         user_id = user_data['id']
         return {"id": user_id, "user": user_data, "error": None}
-    except (decoder.JSONDecodeError, KeyError, TypeError):
-        return {"id": None, "user": None, "error": f"Rate limit (status {response.status_code})"}
+    except decoder.JSONDecodeError:
+        return {"id": None, "user": None, "error": f"Unexpected response (status {response.status_code})"}
+    except (KeyError, TypeError):
+        return {"id": None, "user": None, "error": f"Unexpected API response format (status {response.status_code})"}
 
 
 def _validate_session(session):
@@ -109,30 +111,30 @@ def getInfo(search, sessionId, searchType="username"):
         except ValueError:
             return {"user": None, "error": "Invalid ID"}
 
-    time.sleep(1.5)
+        time.sleep(1.5)
 
-    try:
-        response = _request_with_retry(
-            session.get, session,
-            f'https://i.instagram.com/api/v1/users/{userId}/info/',
-        )
-        if response.status_code == 401:
-            return {"user": None, "error": "Invalid or expired session ID"}
-        if response.status_code == 429:
-            return {"user": None, "error": "Rate limit"}
+        try:
+            response = _request_with_retry(
+                session.get,
+                f'https://i.instagram.com/api/v1/users/{userId}/info/',
+            )
+            if response.status_code == 401:
+                return {"user": None, "error": "Invalid or expired session ID"}
+            if response.status_code == 429:
+                return {"user": None, "error": "Rate limit"}
 
-        response.raise_for_status()
+            response.raise_for_status()
 
-        info_user = response.json().get("user")
-        if not info_user:
+            info_user = response.json().get("user")
+            if not info_user:
+                return {"user": None, "error": "Not found"}
+
+            info_user["userID"] = userId
+            info_user["_session"] = session
+            return {"user": info_user, "error": None}
+
+        except requests.exceptions.RequestException:
             return {"user": None, "error": "Not found"}
-
-        info_user["userID"] = userId
-        info_user["_session"] = session
-        return {"user": info_user, "error": None}
-
-    except requests.exceptions.RequestException:
-        return {"user": None, "error": "Not found"}
 
 
 def advanced_lookup(username, session):
@@ -147,7 +149,7 @@ def advanced_lookup(username, session):
     time.sleep(3 + random.uniform(0, 2))
 
     response = _request_with_retry(
-        session.post, session,
+        session.post,
         'https://i.instagram.com/api/v1/users/lookup/',
         headers={
             "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
@@ -158,10 +160,15 @@ def advanced_lookup(username, session):
         data=data
     )
 
+    if response.status_code in (401, 403):
+        return {"user": None, "error": "Invalid or expired session ID"}
+    if response.status_code == 429:
+        return {"user": None, "error": "rate limit"}
+
     try:
         return {"user": response.json(), "error": None}
     except decoder.JSONDecodeError:
-        return {"user": None, "error": "rate limit"}
+        return {"user": None, "error": "Unexpected response"}
 
 
 def main():
@@ -182,16 +189,16 @@ def main():
     session = infos["user"].pop("_session", None)
     infos = infos["user"]
 
-    print("Informations about     : " + infos["username"])
-    print("userID                 : " + infos["userID"])
-    print("Full Name              : " + infos["full_name"])
-    print("Verified               : " + str(infos['is_verified']) + " | Is buisness Account : " + str(
-        infos["is_business"]))
-    print("Is private Account     : " + str(infos["is_private"]))
+    print("Informations about     : " + infos.get("username", "N/A"))
+    print("userID                 : " + infos.get("userID", "N/A"))
+    print("Full Name              : " + infos.get("full_name", "N/A"))
+    print("Verified               : " + str(infos.get('is_verified', 'N/A')) + " | Is buisness Account : " + str(
+        infos.get("is_business", "N/A")))
+    print("Is private Account     : " + str(infos.get("is_private", "N/A")))
     print(
-        "Follower               : " + str(infos["follower_count"]) + " | Following : " + str(infos["following_count"]))
-    print("Number of posts        : " + str(infos["media_count"]))
-    if infos["external_url"]:
+        "Follower               : " + str(infos.get("follower_count", "N/A")) + " | Following : " + str(infos.get("following_count", "N/A")))
+    print("Number of posts        : " + str(infos.get("media_count", "N/A")))
+    if infos.get("external_url"):
         print("External url           : " + infos["external_url"])
     if "total_igtv_videos" in infos:
         print("IGTV posts             : " + str(infos["total_igtv_videos"]))
@@ -205,7 +212,7 @@ def main():
             print("Public Email           : " + infos["public_email"])
 
     if "public_phone_number" in infos.keys():
-        if str(infos["public_phone_number"]):
+        if infos["public_phone_number"]:
             phonenr = "+" + str(infos["public_phone_country_code"]) + " " + str(infos["public_phone_number"])
             try:
                 pn = phonenumbers.parse(phonenr)
@@ -235,9 +242,11 @@ def main():
                 print("No obfuscated email found")
 
         if "obfuscated_phone" in other_infos["user"].keys():
-            if str(other_infos["user"]["obfuscated_phone"]):
+            if other_infos["user"]["obfuscated_phone"]:
                 print("Obfuscated phone       : " + str(other_infos["user"]["obfuscated_phone"]))
             else:
                 print("No obfuscated phone found")
     print("-" * 24)
-    print("Profile Picture        : " + infos["hd_profile_pic_url_info"]["url"])
+    pic_info = infos.get("hd_profile_pic_url_info")
+    if pic_info and pic_info.get("url"):
+        print("Profile Picture        : " + pic_info["url"])
